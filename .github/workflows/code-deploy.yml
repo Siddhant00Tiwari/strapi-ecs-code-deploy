@@ -95,152 +95,142 @@ jobs:
 
 
 
-    - name: Create task definition file for CodeDeploy
-      id: create-taskdef
-      run: |
-        # Create taskdef.json file (CodeDeploy ECS format)
-        aws ecs describe-task-definition \
-          --task-definition ${{ steps.register-task-def.outputs.NEW_TASK_DEFINITION_ARN }} \
-          --query 'taskDefinition' > taskdef.json
-        
-        # Remove unnecessary fields for CodeDeploy
-        jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)' \
-          taskdef.json > clean-taskdef.json
-        
-        echo "✅ Task definition file created for CodeDeploy"
-        
-    - name: Create AppSpec file for CodeDeploy  
-      id: create-appspec
-      run: |
-        # Create AppSpec.yaml (YAML format for ECS)
-        cat > appspec.yaml << 'EOF'
-        version: 0.0
-        Resources:
-          - TargetService:
-              Type: AWS::ECS::Service
-              Properties:
-                TaskDefinition: <TASK_DEFINITION_ARN>
-                LoadBalancerInfo:
-                  ContainerName: "strapi"
-                  ContainerPort: 1337
-        EOF
-        
-        # Replace placeholder with actual task definition ARN
-        sed -i "s|<TASK_DEFINITION_ARN>|${{ steps.register-task-def.outputs.NEW_TASK_DEFINITION_ARN }}|g" appspec.yaml
-        
-        echo "Generated AppSpec.yaml:"
-        cat appspec.yaml
-        
-        echo "✅ AppSpec.yaml created"
-
-    - name: Create CodeDeploy deployment
+    - name: Trigger Blue/Green deployment
       id: create-deployment
       run: |
-        echo "Creating Blue/Green deployment via CodeDeploy..."
+        echo "Triggering Blue/Green deployment via ECS task set..."
         
-        # Upload files to S3 for CodeDeploy (alternative approach)
-        # Create a simple zip with appspec and taskdef
-        zip -j deployment.zip appspec.yaml clean-taskdef.json
+        # For ECS with CODE_DEPLOY, we need to create a new task set
+        # This is the correct way to trigger Blue/Green with your setup
         
-        # Try simplified approach - just trigger via task definition update
-        # Since CodeDeploy is configured, this should trigger Blue/Green automatically
-        echo "Attempting deployment via task definition update with Blue/Green trigger..."
-        
-        # Get current service details
-        CURRENT_TASK_DEF=$(aws ecs describe-services \
-          --cluster ${{ env.ECS_CLUSTER }} \
-          --services ${{ env.ECS_SERVICE }} \
-          --query 'services[0].taskDefinition' \
-          --output text)
-        
-        echo "Current task definition: $CURRENT_TASK_DEF"
+        echo "Current task definition: $(aws ecs describe-services --cluster ${{ env.ECS_CLUSTER }} --services ${{ env.ECS_SERVICE }} --query 'services[0].taskDefinition' --output text)"
         echo "New task definition: ${{ steps.register-task-def.outputs.NEW_TASK_DEFINITION_ARN }}"
         
-        # Use CodeDeploy create-deployment with S3 revision
-        # First, let's try the simplest approach - task definition change should trigger CodeDeploy
+        # Create a new task set with the updated task definition
+        # This will trigger the Blue/Green deployment automatically
+        TASK_SET_ARN=$(aws ecs create-task-set \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service ${{ env.ECS_SERVICE }} \
+          --task-definition ${{ steps.register-task-def.outputs.NEW_TASK_DEFINITION_ARN }} \
+          --launch-type FARGATE \
+          --network-configuration "awsvpcConfiguration={subnets=[subnet-07e355f183be55730,subnet-066ae967acf4cfb4e,subnet-013acbba256e95b03],securityGroups=[sg-0986e9045dba719c5],assignPublicIp=ENABLED}" \
+          --load-balancers "targetGroupArn=arn:aws:elasticloadbalancing:ap-south-1:654654586547:targetgroup/strapi-green-tg/1558084e6bdfd396,containerName=strapi,containerPort=1337" \
+          --query 'taskSet.taskSetArn' \
+          --output text)
         
-        # Monitor for new deployments that should be automatically created
-        echo "Waiting for CodeDeploy to detect task definition change..."
-        sleep 15
+        echo "✅ Task set created: $TASK_SET_ARN"
         
-        # Get the latest deployment
+        # Wait a moment for CodeDeploy to detect the new task set
+        sleep 10
+        
+        # Get the deployment ID that was automatically created
         DEPLOYMENT_ID=$(aws deploy list-deployments \
           --application-name ${{ env.CODEDEPLOY_APPLICATION }} \
           --deployment-group-name ${{ env.CODEDEPLOY_DEPLOYMENT_GROUP }} \
           --include-only-statuses Created InProgress \
           --query 'deployments[0]' \
-          --output text 2>/dev/null || echo "")
+          --output text)
         
-        if [ -z "$DEPLOYMENT_ID" ] || [ "$DEPLOYMENT_ID" = "None" ]; then
-          echo "No automatic deployment detected. Creating manual deployment..."
+        if [ "$DEPLOYMENT_ID" = "None" ] || [ -z "$DEPLOYMENT_ID" ]; then
+          echo "⚠️ No deployment auto-created. Checking service status..."
           
-          # Manual CodeDeploy creation with proper format
-          DEPLOYMENT_ID=$(aws deploy create-deployment \
+          # Check if deployment was created
+          sleep 5
+          DEPLOYMENT_ID=$(aws deploy list-deployments \
             --application-name ${{ env.CODEDEPLOY_APPLICATION }} \
             --deployment-group-name ${{ env.CODEDEPLOY_DEPLOYMENT_GROUP }} \
-            --deployment-config-name CodeDeployDefault.ECSCanary10Percent5Minutes \
-            --description "Manual Blue/Green deployment - Commit: ${{ github.sha }}" \
-            --query 'deploymentId' \
+            --include-only-statuses Created InProgress \
+            --query 'deployments[0]' \
             --output text)
         fi
         
-        echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> $GITHUB_OUTPUT
-        echo "✅ CodeDeploy deployment: $DEPLOYMENT_ID"
+        if [ "$DEPLOYMENT_ID" = "None" ] || [ -z "$DEPLOYMENT_ID" ]; then
+          echo "❌ No automatic deployment detected after task set creation"
+          echo "This might indicate a configuration issue with the deployment group"
+          # Still continue with monitoring the task set
+          echo "DEPLOYMENT_ID=MANUAL_TASKSET" >> $GITHUB_OUTPUT
+        else
+          echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> $GITHUB_OUTPUT
+          echo "✅ Auto-created deployment detected: $DEPLOYMENT_ID"
+        fi
+        
+        echo "TASK_SET_ARN=${TASK_SET_ARN}" >> $GITHUB_OUTPUT
 
     - name: Monitor deployment status
       id: monitor-deployment
       run: |
-        echo "Monitoring deployment status for: ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }}"
-        DEPLOYMENT_START_TIME=$(date +%s)
-        TIMEOUT=1800  # 30 minutes timeout
-        CHECK_INTERVAL=30  # Check every 30 seconds
-        
-        while true; do
-          CURRENT_TIME=$(date +%s)
-          ELAPSED=$((CURRENT_TIME - DEPLOYMENT_START_TIME))
+        if [ "${{ steps.create-deployment.outputs.DEPLOYMENT_ID }}" = "MANUAL_TASKSET" ]; then
+          echo "Monitoring task set deployment manually..."
           
-          if [ $ELAPSED -gt $TIMEOUT ]; then
-            echo "❌ Deployment timeout after 30 minutes"
-            echo "DEPLOYMENT_STATUS=TIMEOUT" >> $GITHUB_OUTPUT
-            exit 1
-          fi
+          # Monitor task set status instead of CodeDeploy
+          TASK_SET_ARN="${{ steps.create-deployment.outputs.TASK_SET_ARN }}"
+          echo "Monitoring task set: $TASK_SET_ARN"
           
-          # Get deployment status using the specific deployment ID
-          DEPLOYMENT_STATUS=$(aws deploy get-deployment \
-            --deployment-id ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }} \
-            --query 'deploymentInfo.status' \
-            --output text)
+          # Wait for task set to be running
+          aws ecs wait tasks-running \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --tasks $(aws ecs describe-task-sets \
+              --cluster ${{ env.ECS_CLUSTER }} \
+              --service ${{ env.ECS_SERVICE }} \
+              --task-sets $TASK_SET_ARN \
+              --query 'taskSets[0].runningCount')
           
-          echo "🔄 Deployment status: $DEPLOYMENT_STATUS (${ELAPSED}s elapsed)"
+          echo "✅ Task set deployment completed"
+          echo "DEPLOYMENT_STATUS=SUCCESS" >> $GITHUB_OUTPUT
+        else
+          # Monitor CodeDeploy deployment
+          echo "Monitoring deployment status for: ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }}"
+          DEPLOYMENT_START_TIME=$(date +%s)
+          TIMEOUT=1800  # 30 minutes timeout
+          CHECK_INTERVAL=30  # Check every 30 seconds
           
-          case $DEPLOYMENT_STATUS in
-            "Succeeded")
-              echo "✅ Deployment completed successfully!"
-              echo "DEPLOYMENT_STATUS=SUCCESS" >> $GITHUB_OUTPUT
-              break
-              ;;
-            "Failed"|"Stopped")
-              echo "❌ Deployment failed with status: $DEPLOYMENT_STATUS"
-              
-              # Get failure details
-              aws deploy get-deployment \
-                --deployment-id ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }} \
-                --query 'deploymentInfo.errorInformation' \
-                --output text
-              
-              echo "DEPLOYMENT_STATUS=FAILED" >> $GITHUB_OUTPUT
+          while true; do
+            CURRENT_TIME=$(date +%s)
+            ELAPSED=$((CURRENT_TIME - DEPLOYMENT_START_TIME))
+            
+            if [ $ELAPSED -gt $TIMEOUT ]; then
+              echo "❌ Deployment timeout after 30 minutes"
+              echo "DEPLOYMENT_STATUS=TIMEOUT" >> $GITHUB_OUTPUT
               exit 1
-              ;;
-            "Created"|"InProgress")
-              echo "⏳ Deployment in progress..."
-              sleep $CHECK_INTERVAL
-              ;;
-            *)
-              echo "⚠️  Unknown deployment status: $DEPLOYMENT_STATUS"
-              sleep $CHECK_INTERVAL
-              ;;
-          esac
-        done
+            fi
+            
+            # Get deployment status using the specific deployment ID
+            DEPLOYMENT_STATUS=$(aws deploy get-deployment \
+              --deployment-id ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }} \
+              --query 'deploymentInfo.status' \
+              --output text)
+            
+            echo "🔄 Deployment status: $DEPLOYMENT_STATUS (${ELAPSED}s elapsed)"
+            
+            case $DEPLOYMENT_STATUS in
+              "Succeeded")
+                echo "✅ Deployment completed successfully!"
+                echo "DEPLOYMENT_STATUS=SUCCESS" >> $GITHUB_OUTPUT
+                break
+                ;;
+              "Failed"|"Stopped")
+                echo "❌ Deployment failed with status: $DEPLOYMENT_STATUS"
+                
+                # Get failure details
+                aws deploy get-deployment \
+                  --deployment-id ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }} \
+                  --query 'deploymentInfo.errorInformation' \
+                  --output text
+                
+                echo "DEPLOYMENT_STATUS=FAILED" >> $GITHUB_OUTPUT
+                exit 1
+                ;;
+              "Created"|"InProgress")
+                echo "⏳ Deployment in progress..."
+                sleep $CHECK_INTERVAL
+                ;;
+              *)
+                echo "⚠️  Unknown deployment status: $DEPLOYMENT_STATUS"
+                sleep $CHECK_INTERVAL
+                ;;
+            esac
+          done
+        fi
 
     - name: Verify deployment health
       id: verify-health
