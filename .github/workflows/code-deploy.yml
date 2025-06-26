@@ -1,0 +1,289 @@
+name: Strapi Blue/Green Deployment
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: default/strapi-app
+  ECS_CLUSTER: strapi-cluster
+  ECS_SERVICE: strapi-bluegreen-service
+  TASK_DEFINITION_FAMILY: strapi-bluegreen-task
+  ALB_NAME: strapi-bluegreen-alb
+  TARGET_GROUP_NAME: strapi-blue-tg
+  CODEDEPLOY_APPLICATION: strapi-bluegreen-app
+  CODEDEPLOY_DEPLOYMENT_GROUP: strapi-bluegreen-dg
+  CONTAINER_NAME: strapi
+
+jobs:
+  deploy:
+    name: Deploy to AWS ECS
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Generate image tag
+      id: image-tag
+      run: |
+        IMAGE_TAG="${GITHUB_SHA:0:8}"
+        echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+        echo "FULL_IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: true
+        tags: |
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.IMAGE_TAG }}
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        platforms: linux/amd64
+
+    - name: Download current task definition
+      id: download-task-def
+      run: |
+        aws ecs describe-task-definition \
+          --task-definition ${{ env.TASK_DEFINITION_FAMILY }} \
+          --query taskDefinition > task-definition.json
+        
+        # Remove unnecessary fields that cause issues when registering
+        jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)' \
+          task-definition.json > clean-task-definition.json
+        
+        echo "Task definition downloaded and cleaned"
+
+    - name: Update task definition with new image
+      id: update-task-def
+      run: |
+        # Update the Strapi container image
+        jq --arg IMAGE "${{ steps.image-tag.outputs.FULL_IMAGE_URI }}" \
+           '(.containerDefinitions[] | select(.name == "strapi") | .image) = $IMAGE' \
+           clean-task-definition.json > updated-task-definition.json
+        
+        echo "Task definition updated with new image: ${{ steps.image-tag.outputs.FULL_IMAGE_URI }}"
+
+    - name: Register new task definition
+      id: register-task-def
+      run: |
+        NEW_TASK_DEF=$(aws ecs register-task-definition \
+          --cli-input-json file://updated-task-definition.json \
+          --query 'taskDefinition.taskDefinitionArn' \
+          --output text)
+        
+        echo "NEW_TASK_DEFINITION_ARN=${NEW_TASK_DEF}" >> $GITHUB_OUTPUT
+        echo "New task definition registered: $NEW_TASK_DEF"
+
+    - name: Create appspec.json for CodeDeploy
+      id: create-appspec
+      run: |
+        # Create appspec.json for explicit CodeDeploy deployment
+        cat > appspec.json << EOF
+        {
+          "version": "0.0",
+          "Resources": [
+            {
+              "TargetService": {
+                "Type": "AWS::ECS::Service",
+                "Properties": {
+                  "TaskDefinition": "${{ steps.register-task-def.outputs.NEW_TASK_DEFINITION_ARN }}",
+                  "LoadBalancerInfo": {
+                    "ContainerName": "${{ env.CONTAINER_NAME }}",
+                    "ContainerPort": 1337
+                  },
+                  "PlatformVersion": "LATEST"
+                }
+              }
+            }
+          ]
+        }
+        EOF
+        
+        echo "✅ AppSpec.json created for CodeDeploy"
+
+    - name: Create CodeDeploy deployment
+      id: create-deployment
+      run: |
+        echo "Starting explicit Blue/Green deployment via existing CodeDeploy setup..."
+        
+        # Create deployment using your existing CodeDeploy application and deployment group
+        DEPLOYMENT_ID=$(aws deploy create-deployment \
+          --application-name ${{ env.CODEDEPLOY_APPLICATION }} \
+          --deployment-group-name ${{ env.CODEDEPLOY_DEPLOYMENT_GROUP }} \
+          --revision "revisionType=AppSpecContent,appSpecContent={content='$(cat appspec.json | base64 -w 0)'}" \
+          --deployment-config-name CodeDeployDefault.ECSCanary10Percent5Minutes \
+          --description "Blue/Green deployment from GitHub Actions - Commit: ${{ github.sha }}" \
+          --auto-rollback-configuration "enabled=true,events=DEPLOYMENT_FAILURE,DEPLOYMENT_STOP_ON_ALARM" \
+          --query 'deploymentId' \
+          --output text)
+        
+        echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> $GITHUB_OUTPUT
+        echo "✅ Using existing CodeDeploy setup - Deployment created: $DEPLOYMENT_ID"
+        echo "🔄 Application: ${{ env.CODEDEPLOY_APPLICATION }}"
+        echo "🔄 Deployment Group: ${{ env.CODEDEPLOY_DEPLOYMENT_GROUP }}"
+        echo "🔄 Strategy: CodeDeployDefault.ECSCanary10Percent5Minutes"
+
+    - name: Monitor deployment status
+      id: monitor-deployment
+      run: |
+        echo "Monitoring deployment status for: ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }}"
+        DEPLOYMENT_START_TIME=$(date +%s)
+        TIMEOUT=1800  # 30 minutes timeout
+        CHECK_INTERVAL=30  # Check every 30 seconds
+        
+        while true; do
+          CURRENT_TIME=$(date +%s)
+          ELAPSED=$((CURRENT_TIME - DEPLOYMENT_START_TIME))
+          
+          if [ $ELAPSED -gt $TIMEOUT ]; then
+            echo "❌ Deployment timeout after 30 minutes"
+            echo "DEPLOYMENT_STATUS=TIMEOUT" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
+          # Get deployment status using the specific deployment ID
+          DEPLOYMENT_STATUS=$(aws deploy get-deployment \
+            --deployment-id ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }} \
+            --query 'deploymentInfo.status' \
+            --output text)
+          
+          echo "🔄 Deployment status: $DEPLOYMENT_STATUS (${ELAPSED}s elapsed)"
+          
+          case $DEPLOYMENT_STATUS in
+            "Succeeded")
+              echo "✅ Deployment completed successfully!"
+              echo "DEPLOYMENT_STATUS=SUCCESS" >> $GITHUB_OUTPUT
+              break
+              ;;
+            "Failed"|"Stopped")
+              echo "❌ Deployment failed with status: $DEPLOYMENT_STATUS"
+              
+              # Get failure details
+              aws deploy get-deployment \
+                --deployment-id ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }} \
+                --query 'deploymentInfo.errorInformation' \
+                --output text
+              
+              echo "DEPLOYMENT_STATUS=FAILED" >> $GITHUB_OUTPUT
+              exit 1
+              ;;
+            "Created"|"InProgress")
+              echo "⏳ Deployment in progress..."
+              sleep $CHECK_INTERVAL
+              ;;
+            *)
+              echo "⚠️  Unknown deployment status: $DEPLOYMENT_STATUS"
+              sleep $CHECK_INTERVAL
+              ;;
+          esac
+        done
+
+    - name: Verify deployment health
+      id: verify-health
+      run: |
+        echo "Verifying deployment health..."
+        
+        # Wait for ECS service to stabilize
+        aws ecs wait services-stable \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --services ${{ env.ECS_SERVICE }}
+        
+        # Check target group health using specific ARNs from your infrastructure
+        TARGET_GROUPS="arn:aws:elasticloadbalancing:ap-south-1:654654586547:targetgroup/strapi-blue-tg/97a78f571089a8f0 arn:aws:elasticloadbalancing:ap-south-1:654654586547:targetgroup/strapi-green-tg/1558084e6bdfd396"
+        
+        for TG_ARN in $TARGET_GROUPS; do
+          HEALTHY_TARGETS=$(aws elbv2 describe-target-health \
+            --target-group-arn $TG_ARN \
+            --query 'TargetHealthDescriptions[?TargetHealth.State==`healthy`]' \
+            --output text | wc -l)
+          
+          TG_NAME=$(aws elbv2 describe-target-groups \
+            --target-group-arns $TG_ARN \
+            --query 'TargetGroups[0].TargetGroupName' \
+            --output text)
+          
+          echo "Target group $TG_NAME: $HEALTHY_TARGETS healthy targets"
+        done
+        
+        echo "✅ Health check completed"
+
+    - name: Rollback on failure
+      if: failure() && steps.monitor-deployment.outputs.DEPLOYMENT_STATUS == 'FAILED'
+      run: |
+        echo "🔄 Initiating rollback due to deployment failure..."
+        
+        # Stop the current deployment with auto-rollback
+        aws deploy stop-deployment \
+          --deployment-id ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }} \
+          --auto-rollback-enabled
+        
+        echo "❌ Rollback initiated for deployment: ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }}"
+
+    - name: Post deployment summary
+      if: always()
+      run: |
+        echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "- **Commit SHA**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image Tag**: ${{ steps.image-tag.outputs.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image URI**: ${{ steps.image-tag.outputs.FULL_IMAGE_URI }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Deployment ID**: ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }}" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ steps.monitor-deployment.outputs.DEPLOYMENT_STATUS }}" = "SUCCESS" ]; then
+          echo "- **Status**: ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
+        elif [ "${{ steps.monitor-deployment.outputs.DEPLOYMENT_STATUS }}" = "FAILED" ]; then
+          echo "- **Status**: ❌ Deployment Failed" >> $GITHUB_STEP_SUMMARY
+        elif [ "${{ steps.monitor-deployment.outputs.DEPLOYMENT_STATUS }}" = "TIMEOUT" ]; then
+          echo "- **Status**: ⏰ Deployment Timeout" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- **Status**: ⚠️ Unknown Status" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔗 AWS Console Links" >> $GITHUB_STEP_SUMMARY
+        echo "- [ECS Service](https://console.aws.amazon.com/ecs/v2/clusters/${{ env.ECS_CLUSTER }}/services/${{ env.ECS_SERVICE }}/configuration?region=${{ env.AWS_REGION }})" >> $GITHUB_STEP_SUMMARY
+        echo "- [CodeDeploy Application](https://console.aws.amazon.com/codesuite/codedeploy/applications/${{ env.CODEDEPLOY_APPLICATION }}?region=${{ env.AWS_REGION }})" >> $GITHUB_STEP_SUMMARY
+        echo "- [Load Balancer](https://console.aws.amazon.com/ec2/home?region=${{ env.AWS_REGION }}#LoadBalancer:loadBalancerArn=arn:aws:elasticloadbalancing:ap-south-1:654654586547:loadbalancer/app/strapi-bluegreen-alb/bd681dfc4806e0dd)" >> $GITHUB_STEP_SUMMARY
+        echo "- [CloudWatch Dashboard](https://console.aws.amazon.com/cloudwatch/home?region=${{ env.AWS_REGION }}#dashboards:name=strapi-bluegreen-monitoring)" >> $GITHUB_STEP_SUMMARY
+        echo "- [Application URL](http://strapi-bluegreen-alb-1661964011.ap-south-1.elb.amazonaws.com)" >> $GITHUB_STEP_SUMMARY
+        echo "- [Health Check](http://strapi-bluegreen-alb-1661964011.ap-south-1.elb.amazonaws.com/health)" >> $GITHUB_STEP_SUMMARY
+
+  notify:
+    name: Send notifications
+    runs-on: ubuntu-latest
+    needs: deploy
+    if: always()
+    steps:
+    - name: Notify deployment status
+      run: |
+        if [ "${{ needs.deploy.result }}" = "success" ]; then
+          echo "✅ Deployment notification: SUCCESS"
+          # Example Slack notification (uncomment and configure)
+          # curl -X POST -H 'Content-type: application/json' \
+          #   --data '{"text":"✅ Strapi deployment successful! Commit: ${{ github.sha }}"}' \
+          #   ${{ secrets.SLACK_WEBHOOK_URL }}
+        else
+          echo "❌ Deployment notification: FAILURE"
+          # Example Slack failure notification (uncomment and configure)
+          # curl -X POST -H 'Content-type: application/json' \
+          #   --data '{"text":"❌ Strapi deployment failed! Commit: ${{ github.sha }} - Check logs"}' \
+          #   ${{ secrets.SLACK_WEBHOOK_URL }}
+        fi
