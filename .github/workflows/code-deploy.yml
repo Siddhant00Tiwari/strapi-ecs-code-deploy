@@ -97,7 +97,7 @@ jobs:
       id: create-appspec
       run: |
         # Create appspec.json for explicit CodeDeploy deployment
-        cat > appspec.json << EOF
+        cat > appspec.json << 'EOF'
         {
           "version": "0.0",
           "Resources": [
@@ -105,9 +105,9 @@ jobs:
               "TargetService": {
                 "Type": "AWS::ECS::Service",
                 "Properties": {
-                  "TaskDefinition": "${{ steps.register-task-def.outputs.NEW_TASK_DEFINITION_ARN }}",
+                  "TaskDefinition": "<TASK_DEFINITION>",
                   "LoadBalancerInfo": {
-                    "ContainerName": "${{ env.CONTAINER_NAME }}",
+                    "ContainerName": "strapi",
                     "ContainerPort": 1337
                   },
                   "PlatformVersion": "LATEST"
@@ -118,29 +118,36 @@ jobs:
         }
         EOF
         
-        echo "✅ AppSpec.json created for CodeDeploy"
-
-    - name: Create CodeDeploy deployment
-      id: create-deployment
-      run: |
-        echo "Starting explicit Blue/Green deployment via existing CodeDeploy setup..."
+        # Replace placeholder with actual task definition ARN
+        sed -i "s|<TASK_DEFINITION>|${{ steps.register-task-def.outputs.NEW_TASK_DEFINITION_ARN }}|g" appspec.json
         
-        # Create deployment using your existing CodeDeploy application and deployment group
-        DEPLOYMENT_ID=$(aws deploy create-deployment \
+        echo "✅ AppSpec.json created for CodeDeploy"
+        echo "Task Definition: ${{ steps.register-task-def.outputs.NEW_TASK_DEFINITION_ARN }}"
+
+    - name: Create CodeDeploy deployment (Alternative Method)
+      id: create-deployment-alt
+      run: |
+        echo "Using ECS service update to trigger Blue/Green deployment..."
+        
+        # Since your ECS service has deployment_controller = CODE_DEPLOY,
+        # updating the service will automatically trigger CodeDeploy
+        aws ecs update-service \
+          --cluster ${{ env.ECS_CLUSTER }} \
+          --service ${{ env.ECS_SERVICE }} \
+          --task-definition ${{ steps.register-task-def.outputs.NEW_TASK_DEFINITION_ARN }} \
+          --force-new-deployment
+        
+        # Get the most recent deployment ID
+        sleep 10  # Wait for deployment to be created
+        DEPLOYMENT_ID=$(aws deploy list-deployments \
           --application-name ${{ env.CODEDEPLOY_APPLICATION }} \
           --deployment-group-name ${{ env.CODEDEPLOY_DEPLOYMENT_GROUP }} \
-          --revision "revisionType=AppSpecContent,appSpecContent={content='$(cat appspec.json | base64 -w 0)'}" \
-          --deployment-config-name CodeDeployDefault.ECSCanary10Percent5Minutes \
-          --description "Blue/Green deployment from GitHub Actions - Commit: ${{ github.sha }}" \
-          --auto-rollback-configuration "enabled=true,events=DEPLOYMENT_FAILURE,DEPLOYMENT_STOP_ON_ALARM" \
-          --query 'deploymentId' \
+          --include-only-statuses Created InProgress \
+          --query 'deployments[0]' \
           --output text)
         
         echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> $GITHUB_OUTPUT
-        echo "✅ Using existing CodeDeploy setup - Deployment created: $DEPLOYMENT_ID"
-        echo "🔄 Application: ${{ env.CODEDEPLOY_APPLICATION }}"
-        echo "🔄 Deployment Group: ${{ env.CODEDEPLOY_DEPLOYMENT_GROUP }}"
-        echo "🔄 Strategy: CodeDeployDefault.ECSCanary10Percent5Minutes"
+        echo "✅ ECS service updated - CodeDeploy deployment: $DEPLOYMENT_ID"
 
     - name: Monitor deployment status
       id: monitor-deployment
@@ -233,10 +240,10 @@ jobs:
         
         # Stop the current deployment with auto-rollback
         aws deploy stop-deployment \
-          --deployment-id ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }} \
+          --deployment-id ${{ steps.create-deployment-alt.outputs.DEPLOYMENT_ID }} \
           --auto-rollback-enabled
         
-        echo "❌ Rollback initiated for deployment: ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }}"
+        echo "❌ Rollback initiated for deployment: ${{ steps.create-deployment-alt.outputs.DEPLOYMENT_ID }}"
 
     - name: Post deployment summary
       if: always()
@@ -245,7 +252,7 @@ jobs:
         echo "- **Commit SHA**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Image Tag**: ${{ steps.image-tag.outputs.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Image URI**: ${{ steps.image-tag.outputs.FULL_IMAGE_URI }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Deployment ID**: ${{ steps.create-deployment.outputs.DEPLOYMENT_ID }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Deployment ID**: ${{ steps.create-deployment-alt.outputs.DEPLOYMENT_ID }}" >> $GITHUB_STEP_SUMMARY
         
         if [ "${{ steps.monitor-deployment.outputs.DEPLOYMENT_STATUS }}" = "SUCCESS" ]; then
           echo "- **Status**: ✅ Deployment Successful" >> $GITHUB_STEP_SUMMARY
